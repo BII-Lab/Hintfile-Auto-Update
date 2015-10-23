@@ -1,0 +1,140 @@
+#!/usr/bin/env sh 
+
+# name of this script
+NAME='hintUpdate'
+
+# commands to run
+# TODO: version that uses drill (maybe something else for PowerDNS Recursor)
+DIG=/usr/bin/dig
+
+# function to provide syntax help and exit
+syntax() {
+    echo "Syntax: $0 /path/to/hints.txt" 1>&2
+    echo "In this version, we try to update the root hints file specified."
+    echo
+    echo "Syntax: $0 --fetchkeys [/trusted/key/file]" 1>&2
+    echo "In this version, we fetch the trust anchor and store it. If no" 1>&2
+    echo "file is given, then /etc/trusted-key.key is used." 1>&2
+    exit 1
+}
+
+# if we want to get the root keys, do that now
+if [ "$1" = "--fetchkeys" ]; then
+    # if we have no file name given, use the default
+    if [ -z "$2" ]; then
+        TRUSTED_KEY='/etc/trusted-key.key'
+    else
+        TRUSTED_KEY=$2
+    fi
+    $DIG +noall +answer -t dnskey . > $TRUSTED_KEY
+    if [ $? -ne 0 ]; then
+        echo "Error getting DNSKEY record(s) for ." 1>&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# check that we have been passed a valid file
+# TODO: add ability to specify trusted key file
+# TODO: add ability to set DNSSEC to all/none/if available
+if [ ! -f "$1" ]; then
+    syntax
+fi
+
+# make a temporary directory to work in
+TEMPDIR=`mktemp -d`
+
+# this will remove the temporary directory when the script exits
+trap "rm -r $TEMPDIR" 0
+
+# change to our temporary directory, saving our current directory
+SAVEDIR=`pwd`
+cd $TEMPDIR
+
+# get a copy of the current NS for root
+# XXX: we can simplify by turning off DNSSEC if we are not going to validate
+$DIG +sigchase -t ns . >root-checked.txt 2>dig-errors.log
+if [ $? -ne 0 ]; then
+    logger -s -p error -t $NAME -f dig-errors.log
+    logger -s -p error -t $NAME "Unable to get root NS RRSET"
+    exit 1
+fi
+DNSSEC_OKAY=`grep '^;.*SUCCESS$' root-checked.txt`
+exit 2
+if [ -z $DNSSEC_OKAY ]; then
+    logger -s -p error -t $NAME -f root-checked.txt
+    logger -s -p error -t $NAME "Unable to validate root NS RRSET"
+    exit 1
+fi
+
+# use awk to extract out the NS values
+SERVERS=`awk '{if ($4=="NS") print $5}' root-checked.txt`
+
+# iterate over each root server, looking up the A and AAAA records for it
+for domain in $SERVERS
+do
+    # output our NS record
+    printf ".\t\t\t3600000\t\tNS\t$domain\n" >> tempHintFile
+
+    # lookup our A record(s)
+    $DIG +sigchase +trusted-key=./root.keys $domain a >tempresult.txt 2>dig-errors.log
+    if [ $? -ne 0 ]; then
+        logger -s -p error -t $NAME -f dig-errors.log
+        logger -s -p error -t $NAME "Error getting A record(s) for $domain"
+        exit 1
+    fi
+    DNSSEC_OKAY=`grep '^;.*SUCCESS$' root-checked.txt`
+    DNSSEC_OFF=`grep '^;; RRSIG is missing' root-checked.txt`
+    if [ -z "$DNSSEC_OKAY" -a -z "$DNSSEC_OFF" ]; then
+        logger -s -p error -t $NAME -f root-checked.txt
+        logger -s -p error -t $NAME "Unable to validate A record(s) for $domain"
+        exit 1
+    fi
+    # use awk to extract out the IP addresses
+    IPS=`awk '{if ($4=="A") print $5} ' tempresult.txt`
+
+    # add our A record(s) to the hints file
+    for ip in $IPS
+    do
+        printf "$domain\t3600000\t\tA\t$ip\n" >> tempHintFile
+    done
+
+    # lookup our AAAA record(s)
+    $DIG +sigchase +trusted-key=./root.keys $domain aaaa >tempresult.txt 2>dig-errors.log
+    if [ $? -ne 0 ]; then
+        logger -s -p error -t $NAME -f dig-errors.log
+        logger -s -p error -t $NAME "Error getting AAAA record(s) for $domain"
+        exit 1
+    fi
+    DNSSEC_OKAY=`grep '^;.*SUCCESS$' root-checked.txt`
+    DNSSEC_OFF=`grep '^;; RRSIG is missing' root-checked.txt`
+    if [ -z "$DNSSEC_OKAY" -a -z "$DNSSEC_OFF" ]; then
+        logger -s -p error -t $NAME -f root-checked.txt
+        logger -s -p error -t $NAME "Unable to validate AAAA record(s) for $domain"
+        exit 1
+    fi
+    IPS=`awk '{if ($4=="AAAA") print $5} ' tempresult.txt`
+
+    # add our AAAA record(s) to the hints file
+    for ip in $IPS
+    do
+       printf "$domain\t3600000\t\tAAAA\t$ip\n" >> tempHintFile
+    done
+done
+
+# return to our original directory
+cd "$SAVEDIR"
+
+# see if there are changes in the hints file
+diff -q $1 "$TEMPDIR/tempHintFile" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    PREV_ROOT_HINTS_DATE=`date -r "$1" '+%Y%m%d'`
+    # TODO: should probably check that these "mv" work properly and exit
+    #       with an error message if they fail
+    mv $1 $1-${PREV_ROOT_HINTS_DATE}
+    mv "$TEMPDIR/tempHintFile" $1
+    logger -t $NAME "New $1 installed (old saved as $1-${PREV_ROOT_HINTS_DATE})"
+    echo "New $1 installed (old saved as $1-${PREV_ROOT_HINTS_DATE})"
+    # TODO: optionally send e-mail if the file updated
+fi
+
